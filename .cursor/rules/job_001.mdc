@@ -1,0 +1,32 @@
+---
+alwaysApply: true
+---
+
+Sen üst düzey bir React Native, Expo ve Mobil Yapay Zeka (On-Device ML) geliştiricisisin. Geliştirmekte olduğum "performai" isimli, sunum ve postür analizi yapan bitirme projesi uygulamam için mevcut bir tflite entegrasyonunu iki aşamalı (2-stage pipeline) bir makine öğrenimi boru hattına çevirmem gerekiyor.
+
+Şu anda `react-native-vision-camera` (v4), `react-native-fast-tflite` ve `react-native-worklets-core` kullanıyorum. Görüntüyü kameradan alıp `useFrameProcessor` içerisinde `PoseLandmarkDetector.tflite` (ve FaceLandmarkDetector) modeline veriyorum. Bu modeller bana koordinatları başarıyla dönüyor. 
+
+Şimdiye kadar duruş (kamburluk) tespitini bu koordinatlar üzerinden matematiksel hesaplamalar ve sabit eşik değerleri (hardcoded thresholds) ile yapıyordum. Artık bunu profesyonelleştirip, Hugging Face üzerinden bulduğum bir "Vücut Dili Sınıflandırıcı" (BodyLanguageClassifier.tflite) modeli ile değiştirmek istiyorum.
+
+Lütfen bana `live-rehearsal.tsx` dosyamın frame processor kısmını aşağıdaki kurallara ve mimariye göre yeniden yazmam için gereken kodu ve açıklamaları sağla:
+
+1. **İki Aşamalı Mimari (2-Stage Pipeline):** - Kameradan gelen `frame` önce mevcut pose ve face modellerine girecek.
+   - Bulunan landmark dizileri düzleştirilerek (flatten) tek boyutlu bir `Float32Array` haline getirilecek.
+   - Bu düzleştirilmiş dizi, doğrudan yeni modele (`postureClassifierPlugin.model`) girdi (input) olarak verilecek. Kameranın ham görüntüsü asla sınıflandırıcı modele gönderilmeyecek.
+
+2. **Kesin Girdi Boyutu (Input Shape = 2004):**
+   - Netron'dan incelediğim kadarıyla yeni sınıflandırıcı modelimin input shape değeri `float32[-1, 2004]`. Yani model tam olarak 2004 elemanlı bir `Float32Array` bekliyor.
+   - Lütfen kodu yazarken tam 2004 elemanlık (new Float32Array(2004)) bir dizi oluştur.
+   - Elde ettiğimiz pose ve face landmarklarını (x, y, z vb.) bu dizinin içine sırayla dolduracak mantığı kur. Eğer bizim bulduğumuz toplam koordinat sayısı 2004'ten az kalıyorsa, dizinin geri kalanını 0 (sıfır) ile doldurarak (padding) modelin çökmesini engelle.
+
+3. **Frame Skipper (Isınma ve Performans Kontrolü):**
+   - Her frame'de (saniyede 60 kez) birden fazla TFLite modelini senkron (runSync) çalıştırmak cihazı ısıtacağı için bir Frame Skipper mantığı kurgula. Frame processor sadece her 5 karede 1 kez bu AI boru hattını çalıştırsın. Aradaki kareleri doğrudan atlasın (return).
+
+4. **Sonuçların JS Tarafına Aktarımı:**
+   - Sınıflandırıcı model, çıktı olarak olasılıkları (probabilities) içeren bir dizi dönecek.
+   - Eğer modelin çıktısına göre "Kambur/Hatalı" duruş oranı belli bir eşiğin (örneğin %70) üzerindeyse, `react-native-worklets-core` üzerinden oluşturulmuş bir `runOnJS` fonksiyonunu tetikleyerek ekranda animasyonlu "Dik Dur!" bildirimini gösterecek JS fonksiyonunu çağır.
+
+5. **Güvenlik ve Hata Yönetimi:**
+   - Worklet içerisinde uygulamanın çökmemesi için gerekli try-catch bloklarını kur. Modeller yüklenene kadar (null check) işlemin başlamamasını sağla.
+
+Lütfen bana sadece güncellenmiş `useFrameProcessor` bloğunu, model tanımlamalarını ve JS köprüsü (Worklets.createRunOnJS) kodlarını ver. Gerekli kısımlara açıklayıcı yorum satırları ekle.

@@ -27,20 +27,27 @@ export default function LiveRehearsalScreen() {
   const [coachMessage, setCoachMessage] = useState<string | null>(null);
   const [isPoseModelLoaded, setIsPoseModelLoaded] = useState(false);
   const [isFaceModelLoaded, setIsFaceModelLoaded] = useState(false);
+  const [isPostureModelLoaded, setIsPostureModelLoaded] = useState(false);
   const [lastFeedbackTime, setLastFeedbackTime] = useState<number>(0);
   
   const coachCardOpacity = useSharedValue(0);
   const coachCardTranslateY = useSharedValue(-50);
 
-  // Load TFLite Models
+  // Frame skipper counter — her 5 frame'de 1 kez pipeline çalıştırır
+  const frameCounter = useSharedValue(0);
+
+  // TFLite modelleri
   const posePlugin = useTensorflowModel(require('../assets/models/pose/PoseLandmarkDetector.tflite'));
   const facePlugin = useTensorflowModel(require('../assets/models/face/FaceLandmarkDetector.tflite'));
+  // 2. aşama: Vücut dili / duruş sınıflandırıcı (input shape: float32[-1, 2004])
+  const postureClassifier = useTensorflowModel(require('../assets/models/pose/body_language.tflite'));
   const { resize } = useResizePlugin();
 
   useEffect(() => {
     if (posePlugin.model) setIsPoseModelLoaded(true);
     if (facePlugin.model) setIsFaceModelLoaded(true);
-  }, [posePlugin.model, facePlugin.model]);
+    if (postureClassifier.model) setIsPostureModelLoaded(true);
+  }, [posePlugin.model, facePlugin.model, postureClassifier.model]);
 
   useEffect(() => {
     (async () => {
@@ -85,66 +92,10 @@ export default function LiveRehearsalScreen() {
     );
   };
 
-  const analyzePosture = (poseLandmarks: any[], faceLandmarks: any[]) => {
-    // --- 1. POSE ANALYSIS (Slouch Detection) ---
-    if (poseLandmarks.length > 0) {
-      const leftShoulder = poseLandmarks[11];
-      const rightShoulder = poseLandmarks[12];
-      const leftHip = poseLandmarks[23];
-      const rightHip = poseLandmarks[24];
-      const nose = poseLandmarks[0];
-      
-      if (leftShoulder && rightShoulder) {
-        const shoulderWidth = Math.abs(leftShoulder.x - rightShoulder.x);
-        const shoulderYDiff = Math.abs(leftShoulder.y - rightShoulder.y);
-        
-        let isSlouching = false;
-        let slouchReason = "";
-
-        // Check if hips are visible (Y coordinate < 1.0 means it's inside the frame)
-        const areHipsVisible = leftHip && rightHip && leftHip.y < 1.0 && rightHip.y < 1.0;
-
-        if (areHipsVisible) {
-          // FULL BODY: Compare torso height to shoulder width
-          const avgShoulderY = (leftShoulder.y + rightShoulder.y) / 2;
-          const avgHipY = (leftHip.y + rightHip.y) / 2;
-          const torsoHeight = Math.abs(avgHipY - avgShoulderY);
-          
-          console.log(`[POSE] Full Body - Torso Height: ${torsoHeight.toFixed(3)}, Shoulder Width: ${shoulderWidth.toFixed(3)}`);
-          
-          if (torsoHeight < shoulderWidth * 0.8) {
-            isSlouching = true;
-            slouchReason = "Torso compressed (leaning forward)";
-          }
-        } else if (nose) {
-          // HALF BODY: Compare nose-to-shoulder distance to shoulder width
-          const avgShoulderY = (leftShoulder.y + rightShoulder.y) / 2;
-          const neckHeight = Math.abs(avgShoulderY - nose.y);
-          
-          console.log(`[POSE] Half Body - Neck Height: ${neckHeight.toFixed(3)}, Shoulder Width: ${shoulderWidth.toFixed(3)}`);
-          
-          // If neck height is too small relative to shoulder width, head is drooping
-          if (neckHeight < shoulderWidth * 0.4) {
-            isSlouching = true;
-            slouchReason = "Head drooping (neck compressed)";
-          }
-        }
-
-        // Also check if shoulders are heavily tilted (one much higher than the other)
-        if (shoulderYDiff > shoulderWidth * 0.3) {
-          isSlouching = true;
-          slouchReason = "Shoulders uneven";
-        }
-
-        if (isSlouching) {
-          console.log(`[FEEDBACK] Triggering 'Dik Dur!' Reason: ${slouchReason}`);
-          showCoachCard("Dik Dur! (Stand Straight)");
-          return; // Only show one message at a time
-        }
-      }
-    }
-
-    // --- 2. FACE ANALYSIS (Smile & Tilt Detection) ---
+  // Kamburluk / duruş tespiti artık ML sınıflandırıcısı tarafından yapılıyor.
+  // Bu fonksiyon yalnızca yüz analizini (gülümseme, kafa eğikliği) yönetir.
+  const analyzePosture = (_poseLandmarks: any[], faceLandmarks: any[]) => {
+    // --- YÜZ ANALİZİ (Gülümseme & Kafa Eğikliği) ---
     if (faceLandmarks.length > 0) {
       // MediaPipe Face Mesh points:
       // 61: Left mouth corner, 291: Right mouth corner
@@ -232,12 +183,30 @@ export default function LiveRehearsalScreen() {
 
   const updateLandmarksJS = Worklets.createRunOnJS(updateLandmarks);
 
+  // ML sınıflandırıcı kötü duruş tespit ettiğinde worklet'ten JS thread'e köprü
+  const triggerPostureWarning = (confidence: number) => {
+    showCoachCard(`Dik Dur! (%${(confidence * 100).toFixed(0)})`);
+  };
+  const triggerPostureWarningJS = Worklets.createRunOnJS(triggerPostureWarning);
+
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet';
-    if (posePlugin.model == null || facePlugin.model == null) return;
+
+    // Null check: tüm modeller hazır olana kadar işlem yapma
+    if (
+      posePlugin.model == null ||
+      facePlugin.model == null ||
+      postureClassifier.model == null
+    ) return;
+
+    // --- FRAME SKIPPER: performans için her 5 frame'de 1 kez çalış ---
+    frameCounter.value = (frameCounter.value + 1) % 5;
+    if (frameCounter.value !== 0) return;
 
     try {
-      // --- 1. POSE DETECTION ---
+      // ================================================================
+      // AŞAMA 1A — POSE LANDMARK TESPİTİ (256×256)
+      // ================================================================
       const poseResized = resize(frame, {
         scale: { width: 256, height: 256 },
         pixelFormat: 'rgb',
@@ -246,25 +215,16 @@ export default function LiveRehearsalScreen() {
 
       const poseOutputs = posePlugin.model.runSync([poseResized]);
       const poseScoreArray = poseOutputs[0] as Uint8Array;
-      const poseLandmarksArray = poseOutputs[1] as Uint8Array;
-      
-      const poseScore = poseScoreArray[0] * 0.00390625;
-      const parsedPoseLandmarks = [];
-      
-      if (poseScore > 0.5) {
-        const scale = 0.006036719772964716;
-        const zeroPoint = 74;
-        for (let i = 0; i < 25; i++) {
-          const xIndex = i * 4;
-          const yIndex = i * 4 + 1;
-          const xRaw = (poseLandmarksArray[xIndex] - zeroPoint) * scale;
-          const yRaw = (poseLandmarksArray[yIndex] - zeroPoint) * scale;
-          parsedPoseLandmarks.push({ x: xRaw / 256, y: yRaw / 256 });
-        }
-      }
+      const poseLandmarksRaw = poseOutputs[1] as Uint8Array;
 
-      // --- 2. FACE DETECTION ---
-      // FaceLandmarkDetector expects 192x192 input
+      const poseScore = poseScoreArray[0] * 0.00390625;
+      const POSE_SCALE = 0.006036719772964716;
+      const POSE_ZERO_PT = 74;
+      const POSE_POINT_COUNT = 25; // model 25 nokta döndürüyor
+
+      // ================================================================
+      // AŞAMA 1B — FACE LANDMARK TESPİTİ (192×192)
+      // ================================================================
       const faceResized = resize(frame, {
         scale: { width: 192, height: 192 },
         pixelFormat: 'rgb',
@@ -273,37 +233,93 @@ export default function LiveRehearsalScreen() {
 
       const faceOutputs = facePlugin.model.runSync([faceResized]);
       const faceScoreArray = faceOutputs[0] as Uint8Array;
-      const faceLandmarksArray = faceOutputs[1] as Uint8Array;
+      const faceLandmarksRaw = faceOutputs[1] as Uint8Array;
 
-      // Metadata says face score scale is 0.00390625
       const faceScore = faceScoreArray[0] * 0.00390625;
-      const parsedFaceLandmarks = [];
+      const FACE_SCALE = 0.004754403606057167;
+      const FACE_ZERO_PT = 48;
+      const FACE_POINT_COUNT = 468; // MediaPipe Face Mesh: 468 nokta
 
+      // ================================================================
+      // AŞAMA 2 — SINIFLANDIRICI GİRDİSİ OLUŞTUR (Float32Array[2004])
+      // Model input shape: float32[-1, 2004]
+      // Doldurulan değerler: pose 25×2=50 + face 468×2=936 = 986 eleman
+      // Geri kalan 1018 eleman Float32Array varsayılanı olan 0 ile dolu
+      // ================================================================
+      const INPUT_SIZE = 2004;
+      const classifierInput = new Float32Array(INPUT_SIZE); // tamamı 0 ile başlar
+      let offset = 0;
+
+      // --- Pose landmark'larını doldur (25 nokta × [x, y] = 50 değer) ---
+      if (poseScore > 0.5) {
+        for (let i = 0; i < POSE_POINT_COUNT; i++) {
+          const xRaw = (poseLandmarksRaw[i * 4]     - POSE_ZERO_PT) * POSE_SCALE;
+          const yRaw = (poseLandmarksRaw[i * 4 + 1] - POSE_ZERO_PT) * POSE_SCALE;
+          classifierInput[offset++] = xRaw / 256;
+          classifierInput[offset++] = yRaw / 256;
+        }
+      } else {
+        offset += POSE_POINT_COUNT * 2; // pose yok — bu slotları 0 bırak, offset'i atla
+      }
+
+      // --- Face landmark'larını doldur (468 nokta × [x, y] = 936 değer) ---
       if (faceScore > 0.5) {
-        // Metadata says face landmarks scale: 0.004754403606057167, zero_point: 48
-        const faceScale = 0.004754403606057167;
-        const faceZeroPoint = 48;
-        // Face model outputs 468 points, each with 3 coordinates (x, y, z)
-        for (let i = 0; i < 468; i++) {
-          const xIndex = i * 3;
-          const yIndex = i * 3 + 1;
-          const xRaw = (faceLandmarksArray[xIndex] - faceZeroPoint) * faceScale;
-          const yRaw = (faceLandmarksArray[yIndex] - faceZeroPoint) * faceScale;
+        for (let i = 0; i < FACE_POINT_COUNT; i++) {
+          const xRaw = (faceLandmarksRaw[i * 3]     - FACE_ZERO_PT) * FACE_SCALE;
+          const yRaw = (faceLandmarksRaw[i * 3 + 1] - FACE_ZERO_PT) * FACE_SCALE;
+          classifierInput[offset++] = xRaw / 192;
+          classifierInput[offset++] = yRaw / 192;
+        }
+      }
+      // offset = 986; kalan 1018 eleman zaten 0 (padding)
+
+      // ================================================================
+      // AŞAMA 2 — DURUŞ SINIFLANDIRICI'YI ÇALIŞTIR
+      // Çıktı: olasılık dizisi — index 0 = kambur/hatalı duruş olasılığı
+      // ================================================================
+      const classifierOutputs = postureClassifier.model.runSync([classifierInput]);
+      const probabilities = classifierOutputs[0] as Float32Array;
+
+      // Sınıf eşleşmesi model etiketlerine göre ayarlanmalı:
+      // 0 = kambur/hatalı duruş varsayımı — Netron ile doğrulayın
+      const BAD_POSTURE_CLASS_INDEX = 0;
+      const BAD_POSTURE_THRESHOLD = 0.70; // %70 ve üzeri → uyarı tetikle
+
+      if (probabilities[BAD_POSTURE_CLASS_INDEX] > BAD_POSTURE_THRESHOLD) {
+        triggerPostureWarningJS(probabilities[BAD_POSTURE_CLASS_INDEX]);
+      }
+
+      // ================================================================
+      // UI DURUMU GÜNCELLEMESİ — skeleton overlay için landmark'ları JS'e gönder
+      // ================================================================
+      const parsedPoseLandmarks: { x: number; y: number }[] = [];
+      if (poseScore > 0.5) {
+        for (let i = 0; i < POSE_POINT_COUNT; i++) {
+          const xRaw = (poseLandmarksRaw[i * 4]     - POSE_ZERO_PT) * POSE_SCALE;
+          const yRaw = (poseLandmarksRaw[i * 4 + 1] - POSE_ZERO_PT) * POSE_SCALE;
+          parsedPoseLandmarks.push({ x: xRaw / 256, y: yRaw / 256 });
+        }
+      }
+
+      const parsedFaceLandmarks: { x: number; y: number }[] = [];
+      if (faceScore > 0.5) {
+        for (let i = 0; i < FACE_POINT_COUNT; i++) {
+          const xRaw = (faceLandmarksRaw[i * 3]     - FACE_ZERO_PT) * FACE_SCALE;
+          const yRaw = (faceLandmarksRaw[i * 3 + 1] - FACE_ZERO_PT) * FACE_SCALE;
           parsedFaceLandmarks.push({ x: xRaw / 192, y: yRaw / 192 });
         }
       }
 
-      // Send both to JS thread
       updateLandmarksJS(
-        JSON.stringify(parsedPoseLandmarks), 
-        JSON.stringify(parsedFaceLandmarks), 
-        poseScore, 
-        faceScore
+        JSON.stringify(parsedPoseLandmarks),
+        JSON.stringify(parsedFaceLandmarks),
+        poseScore,
+        faceScore,
       );
-    } catch (e) {
-      // Silently fail in worklet
+    } catch (_e) {
+      // Worklet'te uygulama çökmesini önlemek için hataları sessizce yut
     }
-  }, [posePlugin.model, facePlugin.model]);
+  }, [posePlugin.model, facePlugin.model, postureClassifier.model]);
 
   const coachCardStyle = useAnimatedStyle(() => {
     return {
@@ -330,7 +346,7 @@ export default function LiveRehearsalScreen() {
     );
   }
 
-  if (!isPoseModelLoaded || !isFaceModelLoaded) {
+  if (!isPoseModelLoaded || !isFaceModelLoaded || !isPostureModelLoaded) {
     return (
       <View style={styles.centerContainer}>
         <Text style={styles.text}>Loading AI Models...</Text>
