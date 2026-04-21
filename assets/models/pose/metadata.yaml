@@ -1,0 +1,60 @@
+runtime: tflite
+precision: w8a8
+tool_versions:
+  qairt: 2.43.0.260127150333_193827
+  tflite: 2.17.0
+model_files:
+  PoseDetector.tflite:
+    inputs:
+      image:
+        shape: [1, 128, 128, 3]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.003921568859368563
+          zero_point: 0
+    outputs:
+      box_coords_1:
+        shape: [1, 512, 12]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.8183853030204773
+          zero_point: 91
+      box_coords_2:
+        shape: [1, 384, 12]
+        dtype: uint8
+        quantization_parameters:
+          scale: 1.305442214012146
+          zero_point: 109
+      box_scores_1:
+        shape: [1, 512, 1]
+        dtype: uint8
+        quantization_parameters:
+          scale: 6.434305667877197
+          zero_point: 255
+      box_scores_2:
+        shape: [1, 384, 1]
+        dtype: uint8
+        quantization_parameters:
+          scale: 6.300361633300781
+          zero_point: 254
+  PoseLandmarkDetector.tflite:
+    inputs:
+      image:
+        shape: [1, 256, 256, 3]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.003921568859368563
+          zero_point: 0
+    outputs:
+      scores:
+        shape: [1]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.00390625
+          zero_point: 0
+      landmarks:
+        shape: [1, 25, 4]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.006036719772964716
+          zero_point: 74

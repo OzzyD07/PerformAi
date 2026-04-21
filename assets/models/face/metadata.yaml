@@ -1,0 +1,60 @@
+runtime: tflite
+precision: w8a8
+tool_versions:
+  qairt: 2.43.0.260127150333_193827
+  tflite: 2.17.0
+model_files:
+  FaceDetector.tflite:
+    inputs:
+      image:
+        shape: [1, 256, 256, 3]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.003921568859368563
+          zero_point: 0
+    outputs:
+      box_coords_1:
+        shape: [1, 512, 16]
+        dtype: uint8
+        quantization_parameters:
+          scale: 1.4677519798278809
+          zero_point: 181
+      box_coords_2:
+        shape: [1, 384, 16]
+        dtype: uint8
+        quantization_parameters:
+          scale: 1.765931487083435
+          zero_point: 86
+      box_scores_1:
+        shape: [1, 512, 1]
+        dtype: uint8
+        quantization_parameters:
+          scale: 10.458539962768555
+          zero_point: 255
+      box_scores_2:
+        shape: [1, 384, 1]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.3574497401714325
+          zero_point: 247
+  FaceLandmarkDetector.tflite:
+    inputs:
+      image:
+        shape: [1, 192, 192, 3]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.003920967690646648
+          zero_point: 0
+    outputs:
+      scores:
+        shape: [1]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.00390625
+          zero_point: 0
+      landmarks:
+        shape: [1, 468, 3]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.004754403606057167
+          zero_point: 48
