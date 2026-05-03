@@ -1,325 +1,442 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Dimensions } from 'react-native';
-import { Camera, useCameraDevice, useFrameProcessor } from 'react-native-vision-camera';
-import { useResizePlugin } from 'vision-camera-resize-plugin';
-import { useTensorflowModel } from 'react-native-fast-tflite';
-import { useSharedValue, withTiming, useAnimatedStyle, withSequence, withDelay, runOnJS as reanimatedRunOnJS } from 'react-native-reanimated';
-import Animated from 'react-native-reanimated';
-import { Worklets } from 'react-native-worklets-core';
-import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { BlurView } from 'expo-blur';
+import { useRouter } from 'expo-router';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { useTensorflowModel } from 'react-native-fast-tflite';
+import Animated, {
+  runOnJS as reanimatedRunOnJS,
+  useAnimatedStyle,
+  useSharedValue,
+  withDelay,
+  withSequence,
+  withTiming,
+} from 'react-native-reanimated';
+import { Camera, useCameraDevice, useFrameProcessor } from 'react-native-vision-camera';
+import { Worklets } from 'react-native-worklets-core';
+import { useResizePlugin } from 'vision-camera-resize-plugin';
 import { Colors } from '../constants/Colors';
 import { Theme } from '../constants/Theme';
+import { createAnalysisBuffer, generateCoachFeedback } from '../lib/analysis/feedbackRules';
+import { createSessionRecorder } from '../lib/analysis/sessionSummary';
+import type { FeedbackEvent, FrameAnalysisResult } from '../lib/analysis/types';
 
-const { width, height } = Dimensions.get('window');
+/* -------------------------------------------------------------------------- */
+/* Pipeline configuration                                                     */
+/* -------------------------------------------------------------------------- */
 
-// Skeleton connections (basic representation for 25 landmarks)
-// Assuming standard MediaPipe-like connections
+/**
+ * Toggle to stream verbose debug info into the JS console. Keep false in
+ * production so we don't spam logs from the frame processor.
+ */
+const DEBUG_PIPELINE = false;
+
+/**
+ * body_language.tflite expects 2004 floats = 33 pose * 4 + 468 face * 4
+ * (MediaPipe Holistic layout). Our PoseLandmarkDetector only outputs 25
+ * landmarks, so we CANNOT build a valid 2004 vector. Set this flag to
+ * `true` only if the project switches to a 33-point pose model in the
+ * future. See lib/analysis/bodyLanguage.ts for details.
+ */
+const ENABLE_BODY_LANGUAGE_CLASSIFIER = false;
+
+/** Run the ML pipeline every Nth frame. */
+const FRAME_SKIP = 5;
+
+/* -------------------------------------------------------------------------- */
 
 export default function LiveRehearsalScreen() {
   const router = useRouter();
   const device = useCameraDevice('front');
-  
-  const [poseLandmarks, setPoseLandmarks] = useState<any[]>([]);
-  const [faceLandmarks, setFaceLandmarks] = useState<any[]>([]);
+
+  // UI-only state. We deliberately no longer store raw landmark arrays in
+  // React state (they were unused in the render tree and cost a JSON
+  // stringify per processed frame).
   const [isPlayerFound, setIsPlayerFound] = useState(true);
   const [coachMessage, setCoachMessage] = useState<string | null>(null);
   const [isPoseModelLoaded, setIsPoseModelLoaded] = useState(false);
   const [isFaceModelLoaded, setIsFaceModelLoaded] = useState(false);
-  const [isPostureModelLoaded, setIsPostureModelLoaded] = useState(false);
-  const [lastFeedbackTime, setLastFeedbackTime] = useState<number>(0);
-  
+
+  const lastSeenTime = useRef<number>(Date.now());
+  const lastFeedbackRef = useRef<FeedbackEvent | null>(null);
+
+  const bufferRef = useRef(createAnalysisBuffer(2500));
+  const sessionRef = useRef(createSessionRecorder(Date.now()));
+  const sessionSummaryPrintedRef = useRef(false);
+
   const coachCardOpacity = useSharedValue(0);
   const coachCardTranslateY = useSharedValue(-50);
 
-  // Frame skipper counter — her 5 frame'de 1 kez pipeline çalıştırır
   const frameCounter = useSharedValue(0);
 
-  // TFLite modelleri
   const posePlugin = useTensorflowModel(require('../assets/models/pose/PoseLandmarkDetector.tflite'));
   const facePlugin = useTensorflowModel(require('../assets/models/face/FaceLandmarkDetector.tflite'));
-  // 2. aşama: Vücut dili / duruş sınıflandırıcı (input shape: float32[-1, 2004])
-  const postureClassifier = useTensorflowModel(require('../assets/models/pose/body_language.tflite'));
+  // NOTE: body_language.tflite is intentionally NOT loaded here. When
+  // ENABLE_BODY_LANGUAGE_CLASSIFIER is flipped to true (and a 33-point
+  // pose model is in place), re-introduce:
+  //   const postureClassifier = useTensorflowModel(
+  //     require('../assets/models/pose/body_language.tflite'),
+  //   );
+  // and call postureClassifier.model.runSync inside the worklet branch.
+
   const { resize } = useResizePlugin();
 
   useEffect(() => {
     if (posePlugin.model) setIsPoseModelLoaded(true);
     if (facePlugin.model) setIsFaceModelLoaded(true);
-    if (postureClassifier.model) setIsPostureModelLoaded(true);
-  }, [posePlugin.model, facePlugin.model, postureClassifier.model]);
+    // postureClassifier is optional: if it never loads, the pipeline keeps
+    // running using pose/face heuristics.
+  }, [posePlugin.model, facePlugin.model]);
 
   useEffect(() => {
     (async () => {
       try {
         const cameraPermission = await Camera.requestCameraPermission();
+        // The UI copy still mentions microphone access so we keep the
+        // permission request, but no audio pipeline is active (Stage 12).
         const microphonePermission = await Camera.requestMicrophonePermission();
-        
-        console.log('Camera Permission Status:', cameraPermission);
-        console.log('Microphone Permission Status:', microphonePermission);
-
-        if (cameraPermission !== 'granted') {
-          console.log('Camera permission denied');
+        if (DEBUG_PIPELINE) {
+          console.log('[perms] camera =', cameraPermission, 'mic =', microphonePermission);
         }
       } catch (error) {
-        console.error('Error requesting permissions:', error);
+        console.error('[perms] error:', error);
       }
     })();
   }, []);
 
-  const showCoachCard = (message: string) => {
-    const now = Date.now();
-    // Cooldown of 3 seconds to prevent spamming
-    if (now - lastFeedbackTime < 3000) return;
-    if (coachMessage === message) return;
-    
-    setCoachMessage(message);
-    setLastFeedbackTime(now);
-    coachCardTranslateY.value = -50;
-    
-    coachCardOpacity.value = withSequence(
-      withTiming(1, { duration: 300 }),
-      withDelay(1500, withTiming(0, { duration: 300 }, (finished) => {
-        if (finished) {
-          reanimatedRunOnJS(setCoachMessage)(null);
-        }
-      }))
-    );
-    
-    coachCardTranslateY.value = withSequence(
-      withTiming(0, { duration: 300 }),
-      withDelay(1500, withTiming(-50, { duration: 300 }))
-    );
-  };
+  /* ----------------------------------------------------------------------- */
+  /* Coach card                                                              */
+  /* ----------------------------------------------------------------------- */
 
-  // Kamburluk / duruş tespiti artık ML sınıflandırıcısı tarafından yapılıyor.
-  // Bu fonksiyon yalnızca yüz analizini (gülümseme, kafa eğikliği) yönetir.
-  const analyzePosture = (_poseLandmarks: any[], faceLandmarks: any[]) => {
-    // --- YÜZ ANALİZİ (Gülümseme & Kafa Eğikliği) ---
-    if (faceLandmarks.length > 0) {
-      // MediaPipe Face Mesh points:
-      // 61: Left mouth corner, 291: Right mouth corner
-      // 13: Upper lip inner, 14: Lower lip inner
-      // 152: Chin, 10: Top of head
-      const leftMouth = faceLandmarks[61];
-      const rightMouth = faceLandmarks[291];
-      const upperLip = faceLandmarks[13];
-      const lowerLip = faceLandmarks[14];
-      const leftCheek = faceLandmarks[234];
-      const rightCheek = faceLandmarks[454];
-      
-      // Check Head Tilt
-      if (leftCheek && rightCheek) {
-        const headTilt = Math.abs(leftCheek.y - rightCheek.y);
-        const faceWidth = Math.abs(leftCheek.x - rightCheek.x);
-        
-        console.log(`[FACE] Head Tilt: ${headTilt.toFixed(3)}, Face Width: ${faceWidth.toFixed(3)}`);
-        
-        if (headTilt > faceWidth * 0.2) {
-          console.log(`[FEEDBACK] Triggering 'Kafanı Dik Tut!'`);
-          showCoachCard("Kafanı Dik Tut! (Keep Head Straight)");
-          return;
+  const showCoachCard = useCallback(
+    (message: string) => {
+      setCoachMessage(message);
+      coachCardTranslateY.value = -50;
+      coachCardOpacity.value = withSequence(
+        withTiming(1, { duration: 300 }),
+        withDelay(
+          1800,
+          withTiming(0, { duration: 300 }, (finished) => {
+            if (finished) {
+              reanimatedRunOnJS(setCoachMessage)(null);
+            }
+          }),
+        ),
+      );
+      coachCardTranslateY.value = withSequence(
+        withTiming(0, { duration: 300 }),
+        withDelay(1800, withTiming(-50, { duration: 300 })),
+      );
+    },
+    [coachCardOpacity, coachCardTranslateY],
+  );
+
+  /* ----------------------------------------------------------------------- */
+  /* JS-side callback: receive a compact analysis result from the worklet.  */
+  /* ----------------------------------------------------------------------- */
+
+  const onFrameAnalyzed = useCallback((result: FrameAnalysisResult) => {
+    bufferRef.current.push(result);
+    sessionRef.current.onFrameProcessed(result);
+
+    if (result.bodyLanguage.available || result.bodyLanguage.reasonUnavailable) {
+      sessionRef.current.onBodyLanguageAttempt({
+        success: result.bodyLanguage.available,
+        topIndex: result.bodyLanguage.topIndex,
+        topConfidence: result.bodyLanguage.topConfidence,
+        reasonUnavailable: result.bodyLanguage.reasonUnavailable ?? null,
+      });
+    }
+
+    const now = result.timestamp;
+    if (result.pose.available || result.face.available) {
+      lastSeenTime.current = now;
+      setIsPlayerFound((prev) => (prev ? prev : true));
+    } else if (now - lastSeenTime.current > 2000) {
+      setIsPlayerFound((prev) => (prev ? false : prev));
+    }
+  }, []);
+
+  const onFrameAnalyzedJS = useRef(Worklets.createRunOnJS(onFrameAnalyzed)).current;
+
+  /* ----------------------------------------------------------------------- */
+  /* Feedback tick: every 1.5s, aggregate the buffer and show a coach card  */
+  /* if a rule fires. Rule priorities live in lib/analysis/feedbackRules.   */
+  /* ----------------------------------------------------------------------- */
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      const now = Date.now();
+      const agg = bufferRef.current.aggregate(now);
+      const event = generateCoachFeedback(agg, {
+        now,
+        lastEvent: lastFeedbackRef.current,
+      });
+      if (event) {
+        lastFeedbackRef.current = event;
+        sessionRef.current.onFeedback(event);
+        showCoachCard(event.message);
+        if (DEBUG_PIPELINE) {
+          console.log('[feedback]', event.code, '-', event.severity, '-', JSON.stringify(agg));
         }
       }
+    }, 1500);
+    return () => clearInterval(id);
+  }, [showCoachCard]);
 
-      // Check Smile
-      if (leftMouth && rightMouth && upperLip && lowerLip) {
-        // Ensure points are within frame bounds (0-1) to avoid false readings when face is partially off-screen
-        const isMouthInFrame = [leftMouth, rightMouth, upperLip, lowerLip].every(p => p.x > 0 && p.x < 1 && p.y > 0 && p.y < 1);
-        
-        if (isMouthInFrame) {
-          const mouthWidth = Math.abs(leftMouth.x - rightMouth.x);
-          const mouthHeight = Math.abs(upperLip.y - lowerLip.y);
-          
-          const smileRatio = mouthWidth / (mouthHeight + 0.001); // avoid division by zero
-          
-          console.log(`[FACE] Mouth Width: ${mouthWidth.toFixed(3)}, Height: ${mouthHeight.toFixed(3)}, Smile Ratio: ${smileRatio.toFixed(2)}`);
-          
-          // Adjusted threshold based on typical neutral face ratios
-          // A neutral mouth usually has a ratio around 2.0 - 3.0. A smile stretches it wider (3.5+).
-          if (smileRatio < 2.2) {
-            console.log(`[FEEDBACK] Triggering 'Gülümse!' (Ratio: ${smileRatio.toFixed(2)})`);
-            showCoachCard("Gülümse! (Smile!)");
+  /* ----------------------------------------------------------------------- */
+  /* Session lifecycle                                                       */
+  /* ----------------------------------------------------------------------- */
+
+  const finishSession = useCallback(() => {
+    if (sessionSummaryPrintedRef.current) return;
+    sessionSummaryPrintedRef.current = true;
+    const summary = sessionRef.current.build(Date.now());
+    // TODO: wire this up to the history/report screen. No persistence yet.
+    console.log('[session-summary]', JSON.stringify(summary, null, 2));
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      finishSession();
+    };
+  }, [finishSession]);
+
+  const handleClose = useCallback(() => {
+    finishSession();
+    router.back();
+  }, [finishSession, router]);
+
+  /* ----------------------------------------------------------------------- */
+  /* Frame processor worklet                                                 */
+  /* ----------------------------------------------------------------------- */
+
+  const frameProcessor = useFrameProcessor(
+    (frame) => {
+      'worklet';
+
+      // body_language.tflite is never invoked here (see guards below); only
+      // block on the two models we actually consume per frame.
+      if (posePlugin.model == null || facePlugin.model == null) {
+        return;
+      }
+
+      frameCounter.value = (frameCounter.value + 1) % FRAME_SKIP;
+      if (frameCounter.value !== 0) return;
+
+      try {
+        /* ---------- Pose ------------------------------------------------- */
+        const poseResized = resize(frame, {
+          scale: { width: 256, height: 256 },
+          pixelFormat: 'rgb',
+          dataType: 'uint8',
+        });
+        const poseOutputs = posePlugin.model.runSync([poseResized]);
+        const poseScoreArray = poseOutputs[0] as Uint8Array;
+        const poseLandmarksRaw = poseOutputs[1] as Uint8Array;
+
+        // Quantisation params documented in assets/models/pose/metadata.yaml.
+        const POSE_SCORE_SCALE = 0.00390625;
+        const POSE_SCALE = 0.006036719772964716;
+        const POSE_ZERO_PT = 74;
+        const POSE_POINT_COUNT = 25;
+        const POSE_INPUT_SIZE = 256;
+        const poseScore = poseScoreArray[0] * POSE_SCORE_SCALE;
+
+        /* ---------- Face ------------------------------------------------- */
+        const faceResized = resize(frame, {
+          scale: { width: 192, height: 192 },
+          pixelFormat: 'rgb',
+          dataType: 'uint8',
+        });
+        const faceOutputs = facePlugin.model.runSync([faceResized]);
+        const faceScoreArray = faceOutputs[0] as Uint8Array;
+        const faceLandmarksRaw = faceOutputs[1] as Uint8Array;
+
+        const FACE_SCORE_SCALE = 0.00390625;
+        const FACE_SCALE = 0.004754403606057167;
+        const FACE_ZERO_PT = 48;
+        const FACE_POINT_COUNT = 468;
+        const FACE_INPUT_SIZE = 192;
+        const faceScore = faceScoreArray[0] * FACE_SCORE_SCALE;
+
+        /* ---------- Pose signal extraction ------------------------------- */
+        let poseAvailable = poseScore > 0.4;
+        let upperBodyVisible = false;
+        let personCentered = false;
+        let postureScore: number | null = null;
+
+        if (poseAvailable) {
+          let sumX = 0;
+          let sumY = 0;
+          let minY = 1;
+          let maxY = 0;
+          let minX = 1;
+          let maxX = 0;
+          let validCount = 0;
+
+          for (let i = 0; i < POSE_POINT_COUNT; i++) {
+            const xRaw = (poseLandmarksRaw[i * 4] - POSE_ZERO_PT) * POSE_SCALE;
+            const yRaw = (poseLandmarksRaw[i * 4 + 1] - POSE_ZERO_PT) * POSE_SCALE;
+            const x = xRaw / POSE_INPUT_SIZE;
+            const y = yRaw / POSE_INPUT_SIZE;
+            if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
+              sumX += x;
+              sumY += y;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              validCount++;
+            }
+          }
+
+          if (validCount >= 8) {
+            const cx = sumX / validCount;
+            personCentered = cx > 0.3 && cx < 0.7;
+            const bboxHeight = maxY - minY;
+            const bboxWidth = maxX - minX;
+            // Upper body considered visible when the head region (small y)
+            // and torso (larger y) both fall inside the frame.
+            upperBodyVisible = minY < 0.45 && bboxHeight > 0.35;
+
+            // Conservative posture proxy:
+            //   1. horizontal symmetry of the cloud around the centroid
+            //   2. bbox aspect ratio plausibility
+            // Both are NORMALISED heuristics, clearly not a real metric.
+            const symmetry = 1 - Math.min(1, Math.abs(cx - 0.5) / 0.5);
+            const aspect = bboxWidth > 0 ? Math.min(1, bboxHeight / (bboxWidth * 2 + 0.001)) : 0;
+            postureScore = Math.max(0, Math.min(1, 0.6 * symmetry + 0.4 * aspect));
+          } else {
+            poseAvailable = false;
           }
         }
-      }
-    }
-  };
 
-  const updateLandmarks = (poseString: string, faceString: string, poseScore: number, faceScore: number) => {
-    let currentPose = [];
-    let currentFace = [];
+        /* ---------- Face signal extraction ------------------------------- */
+        // We directly index known MediaPipe Face Mesh points (cheek, lip
+        // corners, lip centres). The face landmark model output shape is
+        // [1, 468, 3] (x, y, z) with shared quantisation params.
+        let faceAvailable = faceScore > 0.4;
+        let faceCentered = false;
+        let smileIntensity: number | null = null;
+        let headTilt: number | null = null;
+        let expressionIntensity: number | null = null;
 
-    if (poseScore > 0.5) {
-      try {
-        currentPose = JSON.parse(poseString);
-        setPoseLandmarks(currentPose);
-      } catch (e) {}
-    } else {
-      setPoseLandmarks([]);
-    }
+        // Inline face landmark read - kept as a straight-line worklet-safe
+        // expression per index to avoid relying on nested worklet helper
+        // functions (compiler support varies across toolchains).
+        if (faceAvailable) {
+          const leftCheekX = ((faceLandmarksRaw[234 * 3] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
+          const leftCheekY = ((faceLandmarksRaw[234 * 3 + 1] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
+          const rightCheekX = ((faceLandmarksRaw[454 * 3] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
+          const rightCheekY = ((faceLandmarksRaw[454 * 3 + 1] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
+          const leftMouthX = ((faceLandmarksRaw[61 * 3] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
+          const leftMouthY = ((faceLandmarksRaw[61 * 3 + 1] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
+          const rightMouthX = ((faceLandmarksRaw[291 * 3] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
+          const rightMouthY = ((faceLandmarksRaw[291 * 3 + 1] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
+          const upperLipX = ((faceLandmarksRaw[13 * 3] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
+          const upperLipY = ((faceLandmarksRaw[13 * 3 + 1] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
+          const lowerLipX = ((faceLandmarksRaw[14 * 3] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
+          const lowerLipY = ((faceLandmarksRaw[14 * 3 + 1] - FACE_ZERO_PT) * FACE_SCALE) / FACE_INPUT_SIZE;
 
-    if (faceScore > 0.5) {
-      try {
-        currentFace = JSON.parse(faceString);
-        setFaceLandmarks(currentFace);
-      } catch (e) {}
-    } else {
-      setFaceLandmarks([]);
-    }
+          const leftCheek = { x: leftCheekX, y: leftCheekY };
+          const rightCheek = { x: rightCheekX, y: rightCheekY };
+          const leftMouth = { x: leftMouthX, y: leftMouthY };
+          const rightMouth = { x: rightMouthX, y: rightMouthY };
+          const upperLip = { x: upperLipX, y: upperLipY };
+          const lowerLip = { x: lowerLipX, y: lowerLipY };
 
-    // Player is found if FACE is detected, or if POSE is detected with high confidence
-    // This makes it less strict: if the user is close to the camera (only face visible), it won't say "Player not found"
-    if (faceScore > 0.6 || poseScore > 0.6) {
-      setIsPlayerFound(true);
-    } else {
-      setIsPlayerFound(false);
-    }
+          const cheeksValid =
+            leftCheek.x > 0 && leftCheek.x < 1 && leftCheek.y > 0 && leftCheek.y < 1 &&
+            rightCheek.x > 0 && rightCheek.x < 1 && rightCheek.y > 0 && rightCheek.y < 1;
 
-    if (currentPose.length > 0 || currentFace.length > 0) {
-      analyzePosture(currentPose, currentFace);
-    }
-  };
+          const mouthValid =
+            leftMouth.x > 0 && leftMouth.x < 1 && leftMouth.y > 0 && leftMouth.y < 1 &&
+            rightMouth.x > 0 && rightMouth.x < 1 && rightMouth.y > 0 && rightMouth.y < 1 &&
+            upperLip.x > 0 && upperLip.x < 1 && upperLip.y > 0 && upperLip.y < 1 &&
+            lowerLip.x > 0 && lowerLip.x < 1 && lowerLip.y > 0 && lowerLip.y < 1;
 
-  const updateLandmarksJS = Worklets.createRunOnJS(updateLandmarks);
+          if (cheeksValid) {
+            const faceWidth = Math.abs(leftCheek.x - rightCheek.x);
+            const tilt = faceWidth > 0.01 ? Math.abs(leftCheek.y - rightCheek.y) / faceWidth : 0;
+            headTilt = Math.max(0, Math.min(1, tilt));
+            const cx = (leftCheek.x + rightCheek.x) / 2;
+            faceCentered = cx > 0.3 && cx < 0.7;
+          } else {
+            faceAvailable = false;
+          }
 
-  // ML sınıflandırıcı kötü duruş tespit ettiğinde worklet'ten JS thread'e köprü
-  const triggerPostureWarning = (confidence: number) => {
-    showCoachCard(`Dik Dur! (%${(confidence * 100).toFixed(0)})`);
-  };
-  const triggerPostureWarningJS = Worklets.createRunOnJS(triggerPostureWarning);
+          if (faceAvailable && mouthValid) {
+            const mouthWidth = Math.abs(leftMouth.x - rightMouth.x);
+            const mouthHeight = Math.abs(upperLip.y - lowerLip.y);
+            const ratio = mouthWidth / (mouthHeight + 0.001);
+            // ratio ~ 2.0-3.0 at neutral, >= 3.5 on a smile.
+            smileIntensity = Math.max(0, Math.min(1, (ratio - 2.0) / 2.5));
+          }
 
-  const frameProcessor = useFrameProcessor((frame) => {
-    'worklet';
-
-    // Null check: tüm modeller hazır olana kadar işlem yapma
-    if (
-      posePlugin.model == null ||
-      facePlugin.model == null ||
-      postureClassifier.model == null
-    ) return;
-
-    // --- FRAME SKIPPER: performans için her 5 frame'de 1 kez çalış ---
-    frameCounter.value = (frameCounter.value + 1) % 5;
-    if (frameCounter.value !== 0) return;
-
-    try {
-      // ================================================================
-      // AŞAMA 1A — POSE LANDMARK TESPİTİ (256×256)
-      // ================================================================
-      const poseResized = resize(frame, {
-        scale: { width: 256, height: 256 },
-        pixelFormat: 'rgb',
-        dataType: 'uint8',
-      });
-
-      const poseOutputs = posePlugin.model.runSync([poseResized]);
-      const poseScoreArray = poseOutputs[0] as Uint8Array;
-      const poseLandmarksRaw = poseOutputs[1] as Uint8Array;
-
-      const poseScore = poseScoreArray[0] * 0.00390625;
-      const POSE_SCALE = 0.006036719772964716;
-      const POSE_ZERO_PT = 74;
-      const POSE_POINT_COUNT = 25; // model 25 nokta döndürüyor
-
-      // ================================================================
-      // AŞAMA 1B — FACE LANDMARK TESPİTİ (192×192)
-      // ================================================================
-      const faceResized = resize(frame, {
-        scale: { width: 192, height: 192 },
-        pixelFormat: 'rgb',
-        dataType: 'uint8',
-      });
-
-      const faceOutputs = facePlugin.model.runSync([faceResized]);
-      const faceScoreArray = faceOutputs[0] as Uint8Array;
-      const faceLandmarksRaw = faceOutputs[1] as Uint8Array;
-
-      const faceScore = faceScoreArray[0] * 0.00390625;
-      const FACE_SCALE = 0.004754403606057167;
-      const FACE_ZERO_PT = 48;
-      const FACE_POINT_COUNT = 468; // MediaPipe Face Mesh: 468 nokta
-
-      // ================================================================
-      // AŞAMA 2 — SINIFLANDIRICI GİRDİSİ OLUŞTUR (Float32Array[2004])
-      // Model input shape: float32[-1, 2004]
-      // Doldurulan değerler: pose 25×2=50 + face 468×2=936 = 986 eleman
-      // Geri kalan 1018 eleman Float32Array varsayılanı olan 0 ile dolu
-      // ================================================================
-      const INPUT_SIZE = 2004;
-      const classifierInput = new Float32Array(INPUT_SIZE); // tamamı 0 ile başlar
-      let offset = 0;
-
-      // --- Pose landmark'larını doldur (25 nokta × [x, y] = 50 değer) ---
-      if (poseScore > 0.5) {
-        for (let i = 0; i < POSE_POINT_COUNT; i++) {
-          const xRaw = (poseLandmarksRaw[i * 4]     - POSE_ZERO_PT) * POSE_SCALE;
-          const yRaw = (poseLandmarksRaw[i * 4 + 1] - POSE_ZERO_PT) * POSE_SCALE;
-          classifierInput[offset++] = xRaw / 256;
-          classifierInput[offset++] = yRaw / 256;
+          if (faceAvailable) {
+            const smileTerm = smileIntensity ?? 0;
+            const tiltTerm = headTilt ?? 0;
+            // Very rough proxy: combines how much the mouth deviates from
+            // the neutral ratio with how much the head is tilted. This is
+            // NOT an emotion estimate.
+            expressionIntensity = Math.max(0, Math.min(1, 0.7 * smileTerm + 0.3 * tiltTerm));
+          }
         }
-      } else {
-        offset += POSE_POINT_COUNT * 2; // pose yok — bu slotları 0 bırak, offset'i atla
-      }
 
-      // --- Face landmark'larını doldur (468 nokta × [x, y] = 936 değer) ---
-      if (faceScore > 0.5) {
-        for (let i = 0; i < FACE_POINT_COUNT; i++) {
-          const xRaw = (faceLandmarksRaw[i * 3]     - FACE_ZERO_PT) * FACE_SCALE;
-          const yRaw = (faceLandmarksRaw[i * 3 + 1] - FACE_ZERO_PT) * FACE_SCALE;
-          classifierInput[offset++] = xRaw / 192;
-          classifierInput[offset++] = yRaw / 192;
+        /* ---------- body_language.tflite (skipped unless enabled) ------- */
+        let bodyLanguageAvailable = false;
+        let bodyLanguageTopIndex: number | null = null;
+        let bodyLanguageTopConfidence: number | null = null;
+        let bodyLanguageOutputLength: number | null = null;
+        let bodyLanguageReason: string | undefined =
+          'Disabled: PoseLandmarkDetector.tflite outputs 25 landmarks; body_language.tflite needs 33 (MediaPipe Holistic). See lib/analysis/bodyLanguage.ts.';
+
+        if (ENABLE_BODY_LANGUAGE_CLASSIFIER && poseAvailable && faceAvailable) {
+          // This branch is intentionally unreachable under the current
+          // model set. The code below is kept as a reference for when a
+          // 33-point MediaPipe pose model is added. When that happens, we
+          // must also move landmark parsing to produce 33 pose points with
+          // (x, y, z, visibility) and 468 face points (x, y, z, 1.0).
+          bodyLanguageReason = 'Not yet wired up for 33-point pose model.';
         }
+
+        /* ---------- Emit compact result to JS --------------------------- */
+        const result: FrameAnalysisResult = {
+          timestamp: Date.now(),
+          pose: {
+            available: poseAvailable,
+            score: poseScore,
+            personCentered,
+            upperBodyVisible,
+            postureScore,
+          },
+          face: {
+            available: faceAvailable,
+            score: faceScore,
+            faceVisible: faceAvailable,
+            faceCentered,
+            smileIntensity,
+            headTilt,
+            expressionIntensity,
+          },
+          bodyLanguage: {
+            available: bodyLanguageAvailable,
+            topIndex: bodyLanguageTopIndex,
+            topConfidence: bodyLanguageTopConfidence,
+            outputLength: bodyLanguageOutputLength,
+            reasonUnavailable: bodyLanguageAvailable ? undefined : bodyLanguageReason,
+          },
+        };
+
+        onFrameAnalyzedJS(result);
+      } catch (_e) {
+        // Worklet errors are intentionally swallowed to avoid crashing the
+        // camera pipeline. Enable DEBUG_PIPELINE to surface them in JS.
       }
-      // offset = 986; kalan 1018 eleman zaten 0 (padding)
-
-      // ================================================================
-      // AŞAMA 2 — DURUŞ SINIFLANDIRICI'YI ÇALIŞTIR
-      // Çıktı: olasılık dizisi — index 0 = kambur/hatalı duruş olasılığı
-      // ================================================================
-      const classifierOutputs = postureClassifier.model.runSync([classifierInput]);
-      const probabilities = classifierOutputs[0] as Float32Array;
-
-      // Sınıf eşleşmesi model etiketlerine göre ayarlanmalı:
-      // 0 = kambur/hatalı duruş varsayımı — Netron ile doğrulayın
-      const BAD_POSTURE_CLASS_INDEX = 0;
-      const BAD_POSTURE_THRESHOLD = 0.70; // %70 ve üzeri → uyarı tetikle
-
-      if (probabilities[BAD_POSTURE_CLASS_INDEX] > BAD_POSTURE_THRESHOLD) {
-        triggerPostureWarningJS(probabilities[BAD_POSTURE_CLASS_INDEX]);
-      }
-
-      // ================================================================
-      // UI DURUMU GÜNCELLEMESİ — skeleton overlay için landmark'ları JS'e gönder
-      // ================================================================
-      const parsedPoseLandmarks: { x: number; y: number }[] = [];
-      if (poseScore > 0.5) {
-        for (let i = 0; i < POSE_POINT_COUNT; i++) {
-          const xRaw = (poseLandmarksRaw[i * 4]     - POSE_ZERO_PT) * POSE_SCALE;
-          const yRaw = (poseLandmarksRaw[i * 4 + 1] - POSE_ZERO_PT) * POSE_SCALE;
-          parsedPoseLandmarks.push({ x: xRaw / 256, y: yRaw / 256 });
-        }
-      }
-
-      const parsedFaceLandmarks: { x: number; y: number }[] = [];
-      if (faceScore > 0.5) {
-        for (let i = 0; i < FACE_POINT_COUNT; i++) {
-          const xRaw = (faceLandmarksRaw[i * 3]     - FACE_ZERO_PT) * FACE_SCALE;
-          const yRaw = (faceLandmarksRaw[i * 3 + 1] - FACE_ZERO_PT) * FACE_SCALE;
-          parsedFaceLandmarks.push({ x: xRaw / 192, y: yRaw / 192 });
-        }
-      }
-
-      updateLandmarksJS(
-        JSON.stringify(parsedPoseLandmarks),
-        JSON.stringify(parsedFaceLandmarks),
-        poseScore,
-        faceScore,
-      );
-    } catch (_e) {
-      // Worklet'te uygulama çökmesini önlemek için hataları sessizce yut
-    }
-  }, [posePlugin.model, facePlugin.model, postureClassifier.model]);
+    },
+    [posePlugin.model, facePlugin.model],
+  );
 
   const coachCardStyle = useAnimatedStyle(() => {
     return {
@@ -328,17 +445,13 @@ export default function LiveRehearsalScreen() {
     };
   });
 
-  // Removed permission check UI
-  // if (hasPermission === false) { ... }
-  // if (hasPermission === null) { ... }
-
   if (device == null) {
     return (
       <View style={styles.centerContainer}>
         <Text style={styles.text}>No front camera found.</Text>
-        <TouchableOpacity 
+        <TouchableOpacity
           style={{ marginTop: 20, padding: 12, backgroundColor: Colors.primary, borderRadius: 8 }}
-          onPress={() => router.back()}
+          onPress={handleClose}
         >
           <Text style={{ color: '#FFF', fontWeight: 'bold' }}>Go Back</Text>
         </TouchableOpacity>
@@ -346,7 +459,11 @@ export default function LiveRehearsalScreen() {
     );
   }
 
-  if (!isPoseModelLoaded || !isFaceModelLoaded || !isPostureModelLoaded) {
+  // Pose and face models are required for the pipeline. body_language.tflite
+  // is OPTIONAL - even if it's missing or still loading, we enter the screen
+  // and fall back to pose/face heuristics. This matches Stage 13 (graceful
+  // degradation) of the pipeline spec.
+  if (!isPoseModelLoaded || !isFaceModelLoaded) {
     return (
       <View style={styles.centerContainer}>
         <Text style={styles.text}>Loading AI Models...</Text>
@@ -362,17 +479,15 @@ export default function LiveRehearsalScreen() {
         isActive={true}
         frameProcessor={frameProcessor}
       />
-      
-      {/* Top Bar */}
+
       <View style={styles.topBar}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.closeButton}>
+        <TouchableOpacity onPress={handleClose} style={styles.closeButton}>
           <Ionicons name="close" size={28} color="#FFF" />
         </TouchableOpacity>
         <Text style={styles.title}>Live Rehearsal</Text>
         <View style={{ width: 40 }} />
       </View>
 
-      {/* Coach Card */}
       {coachMessage && (
         <Animated.View style={[styles.coachCardContainer, coachCardStyle]}>
           <BlurView intensity={60} tint="dark" style={styles.coachCard}>
@@ -382,7 +497,6 @@ export default function LiveRehearsalScreen() {
         </Animated.View>
       )}
 
-      {/* Framing Control Warning */}
       {!isPlayerFound && (
         <View style={styles.warningOverlay}>
           <BlurView intensity={40} tint="dark" style={styles.warningCard}>

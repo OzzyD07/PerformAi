@@ -1,0 +1,413 @@
+---
+alwaysApply: true
+---
+
+You are a senior React Native + Expo Dev Client engineer and an AI model pipeline engineer.
+
+I am working on my senior graduation project called PerformAi. The project is an AI-assisted acting performance analysis and coaching mobile app. The goal is to analyze an actor’s live rehearsal performance using camera-based pose, face, and body-language signals, then show short real-time coaching feedback cards.
+
+The UI is mostly ready, but the ML pipeline/workflow is not reliable enough. I need you to inspect, refactor, stabilize, and document the live rehearsal analysis pipeline.
+
+Important:
+Do not rewrite the whole app.
+Do not change the UI design unless necessary for debugging or integration.
+Do not implement audio/Whisper/diction analysis in this task.
+Focus only on camera-based live rehearsal analysis.
+
+Project context:
+- React Native + Expo SDK ~54
+- expo-dev-client is used
+- Expo Router is used
+- main entry is expo-router/entry
+- react-native-vision-camera v4 is installed
+- useFrameProcessor + worklet are used
+- vision-camera-resize-plugin is installed
+- react-native-worklets-core is installed
+- react-native-fast-tflite is used for inference
+- useTensorflowModel and model.runSync are used
+- Firebase is not currently installed
+- There is no custom native Android Kotlin/Java module in package.json
+- android/ folder may not be visible in this workspace; inspect the project
+- Current inference approach is JS/worklet + react-native-fast-tflite
+- Do NOT switch to MediaPipe Task API in this task
+- Do NOT add a native Android module unless absolutely necessary
+
+Main existing screen:
+- app/live-rehearsal.tsx
+
+Other relevant screens:
+- app/(tabs)/index.tsx
+- app/(tabs)/rehearsal.tsx
+- app/(tabs)/history.tsx
+- app/(tabs)/profile.tsx
+- app/(auth)/login.tsx
+- app/index.tsx
+- layout files
+
+Relevant model files:
+- assets/models/pose/PoseLandmarkDetector.tflite
+- assets/models/face/FaceLandmarkDetector.tflite
+- assets/models/pose/body_language.tflite
+
+Possibly present but not currently imported:
+- assets/models/pose/PoseDetector.tflite
+- assets/models/face/FaceDetector.tflite
+
+The detector models are optional for this task. First stabilize the existing pipeline using:
+PoseLandmark + FaceLandmark + body_language.tflite + feedback system.
+
+Very important model information:
+The body_language.tflite model comes from:
+https://huggingface.co/ThisIs-Developer/Body-Language-Detection-with-MediaPipe-and-OpenCV
+
+The known input shape is:
+float32[-1, 2004]
+
+This means:
+- body_language.tflite does NOT expect a raw camera image.
+- body_language.tflite expects a flattened landmark feature vector.
+- Do NOT feed resized camera frame/image directly into body_language.tflite.
+- The input should be a Float32Array with length 2004 for a single sample.
+
+Likely feature structure:
+2004 = 501 landmarks * 4 values
+501 landmarks may be:
+- 33 pose landmarks
+- 468 face landmarks
+- each landmark may use x, y, z, visibility/presence
+However, this order and exact feature mapping must be verified as much as possible from the repo, model metadata, README, Hugging Face page, or existing code.
+
+Do not silently fake the 2004 input.
+If the current pose + face landmark outputs cannot reliably create exactly 2004 values:
+- add a clear debug warning
+- skip body_language inference safely
+- use pose/face heuristic feedback as fallback
+- do not crash the app
+
+Current problematic assumption:
+Existing code may assume:
+BAD_POSTURE_CLASS_INDEX = 0
+
+This is likely wrong or unverified.
+Remove or clearly mark this assumption as provisional.
+Do NOT assume class index 0 means bad posture unless confirmed.
+The body_language model appears to be more like an expression/body-language/emotion classifier, not a simple “bad posture” detector.
+
+Therefore:
+- Use body_language.tflite for general expression/body-language classification only if input/output mapping is valid.
+- Use pose landmark heuristics for posture feedback such as “stand straighter”, “open shoulders”, “upper body not visible”, etc.
+- Use face landmark heuristics for face visibility and expression intensity.
+- Do not claim exact emotions unless the class mapping is verified.
+
+Main goal:
+Create a stable live rehearsal analysis pipeline:
+
+Camera Frame
+  ↓
+Frame Processor
+  ↓
+Resize / normalize input for landmark models
+  ↓
+PoseLandmarkDetector.tflite
+  ↓
+Pose landmark parser
+  ↓
+FaceLandmarkDetector.tflite
+  ↓
+Face landmark parser
+  ↓
+Prepare 2004-length landmark vector for body_language.tflite
+  ↓
+body_language.tflite inference, only if input is valid
+  ↓
+Body language output parser
+  ↓
+2–3 second temporal buffer
+  ↓
+Rule engine
+  ↓
+Coach feedback card
+  ↓
+Session summary placeholder
+
+Stage 1 — Inspect the repository first:
+Before changing code, inspect:
+- package.json
+- app/live-rehearsal.tsx
+- model imports and paths
+- metadata.yaml files
+- body_language references
+- BAD_POSTURE_CLASS_INDEX references
+- runSync usage
+- useTensorflowModel usage
+- frameProcessor usage
+- resize usage
+- pose parsing logic
+- face parsing logic
+- feedback / coach card logic
+
+Search for:
+- body_language
+- BAD_POSTURE_CLASS_INDEX
+- runSync
+- useTensorflowModel
+- resize
+- frameProcessor
+- pose
+- face
+- coach
+- feedback
+- landmark
+
+Then explain the current pipeline briefly before implementing changes.
+
+Stage 2 — Verify model paths and model loading:
+- Confirm whether each model file exists.
+- Confirm which models are actually loaded in live-rehearsal.
+- Handle loading states.
+- Handle missing model files gracefully.
+- Handle unexpected model output shapes gracefully.
+- Do not crash the app if a model fails.
+
+Stage 3 — Refactor the ML logic into clear helper functions:
+Create helper functions if needed. Possible functions:
+
+- parsePoseLandmarks(...)
+- parseFaceLandmarks(...)
+- prepareBodyLanguageInput(...)
+- parseBodyLanguageOutput(...)
+- analyzePoseHeuristics(...)
+- analyzeFaceHeuristics(...)
+- updateAnalysisBuffer(...)
+- generateCoachFeedback(...)
+- shouldShowFeedback(...)
+- buildSessionSummaryPlaceholder(...)
+
+If cleaner, create files like:
+- lib/analysis/types.ts
+- lib/analysis/poseAnalysis.ts
+- lib/analysis/faceAnalysis.ts
+- lib/analysis/bodyLanguage.ts
+- lib/analysis/feedbackRules.ts
+- lib/analysis/sessionSummary.ts
+
+Only create new files if it improves readability.
+Do not over-engineer.
+
+Stage 4 — Correct body_language.tflite input handling:
+Implement prepareBodyLanguageInput carefully.
+
+Rules:
+- Output must be Float32Array length 2004.
+- Do not feed image tensors to body_language.tflite.
+- Use pose + face landmarks if they can be parsed.
+- Try to build the vector as:
+  pose landmarks first, then face landmarks
+  each landmark as x, y, z, visibility/presence
+- Mark this order as provisional unless verified.
+- For face landmarks, if visibility is not available, use a clearly documented fallback such as 1.0 only if this is necessary to match the 2004 input.
+- If the vector length is not exactly 2004, skip body_language inference and log/debug the issue.
+- If the body_language model input shape does not match the prepared vector, skip safely.
+
+Example behavior:
+if preparedBodyLanguageInput.length === 2004:
+  run body_language model
+else:
+  skip body_language model
+  use pose/face heuristic feedback only
+
+Stage 5 — Correct body_language output handling:
+- Inspect output shape if possible.
+- Do not invent labels.
+- If label mapping is available from metadata/model card/repo, use it.
+- If label mapping is not confirmed, create a provisional label config and clearly mark it as provisional.
+- Keep debug output showing:
+  - raw output length
+  - top class index
+  - top class confidence
+  - top 3 class indexes if possible
+- Do not use body_language output for “bad posture” unless label mapping proves that class.
+- Remove or replace BAD_POSTURE_CLASS_INDEX = 0 assumption.
+- If existing UI depends on it, rename it to PROVISIONAL_CLASS_INDEX and clearly document it.
+
+Stage 6 — Add conservative pose heuristics:
+Use pose landmarks for posture-related coaching.
+
+Possible pose heuristics:
+- person/player visible or lost
+- upper body visible
+- shoulders visible
+- shoulder alignment
+- shoulders too closed if approximable
+- posture strength / chest openness if approximable
+- too close / too far if approximable
+- low pose confidence
+- tracking lost for more than 2 seconds
+
+Do not overclaim.
+Use conservative messages.
+
+Examples:
+- “Step back a little so your upper body is fully visible.”
+- “Keep your shoulders more open for a stronger stage presence.”
+- “Try to lift your chest slightly and hold a more confident posture.”
+- “Your body is not fully visible. Move into the camera frame.”
+
+Stage 7 — Add conservative face heuristics:
+Use face landmarks for face-related coaching.
+
+Possible face heuristics:
+- face visible / not visible
+- expression intensity approximation
+- very neutral face over time
+- face not centered if approximable
+- low face tracking confidence
+
+Do not overclaim exact emotion unless body_language label mapping is confirmed.
+
+Examples:
+- “Your face is visible, but your expression looks too neutral. Try to make the emotion clearer.”
+- “Keep your face inside the camera frame.”
+- “Try to make your facial expression more readable for the audience.”
+
+Stage 8 — Add temporal buffer:
+Do not generate feedback from a single frame.
+
+Implement a rolling analysis buffer for the last 2–3 seconds.
+The buffer should store compact analysis results, not large landmark arrays.
+
+Example compact result:
+{
+  timestamp,
+  poseVisible,
+  faceVisible,
+  postureScore,
+  expressionIntensity,
+  bodyLanguageTopIndex,
+  bodyLanguageTopConfidence,
+  bodyLanguageAvailable
+}
+
+Use aggregated results from the buffer to decide feedback.
+
+Rules:
+- Feedback should be generated around every 2 seconds.
+- General cooldown should be around 3 seconds.
+- Do not repeat the same feedback back-to-back.
+- If the player/person is lost for around 2 seconds, show a camera positioning message.
+- Prefer positive/coach-like feedback when posture is good.
+
+Stage 9 — Improve feedback rule engine:
+Create clear rule priority.
+
+Suggested priority:
+1. Person/body not visible
+2. Face not visible
+3. Upper body not fully visible
+4. Posture/shoulder issue from pose heuristics
+5. Neutral/low expression from face heuristics
+6. body_language result if mapping is available and confidence is high
+7. positive reinforcement
+
+Feedback should be short and acting-coach-like.
+
+Examples:
+- “Move back slightly so your upper body is fully visible.”
+- “Keep your shoulders more open. Your posture looks a little closed.”
+- “Try to lift your chest and hold a stronger stage presence.”
+- “Your expression looks too neutral. Make the emotion clearer.”
+- “Good posture. Keep this alignment while delivering the line.”
+
+Use the app’s current language style.
+If the current screen uses Turkish, use Turkish feedback.
+If it uses English, use English feedback.
+Do not add a new i18n system.
+
+Stage 10 — Performance requirements:
+- Do not run the full pipeline on every frame.
+- Keep the current idea of running every 5 frames or similar.
+- Avoid expensive JS state updates inside the frame processor.
+- Avoid sending large arrays to JS every frame.
+- Use runOnJS only for compact results.
+- Keep UI smooth.
+- Avoid memory leaks.
+- Avoid huge console logs every frame.
+- Add debug logs only behind a debug flag if needed.
+
+Stage 11 — Session summary placeholder:
+There is currently no real report screen.
+history.tsx uses mock sessions.
+
+Do not build a full report screen now.
+But prepare a session summary object/state that can later be connected to history/report screens.
+
+Suggested structure:
+{
+  startedAt,
+  endedAt,
+  durationMs,
+  totalProcessedFrames,
+  trackingLostCount,
+  feedbackEvents,
+  postureWarnings,
+  faceVisibilityWarnings,
+  bodyLanguageAvailable,
+  bodyLanguageDebugStats,
+  assumptions
+}
+
+When the live rehearsal ends:
+- build this summary
+- log it or keep it in state
+- do not add Firebase
+- do not add persistence yet
+
+Stage 12 — Do not implement audio:
+The app may ask for microphone permission, but there is no real audio pipeline yet.
+
+For this task:
+- Do not implement Whisper
+- Do not implement speech recognition
+- Do not implement voice emotion analysis
+- Do not implement diction analysis
+- You may leave a placeholder comment/interface for future audio analysis
+- Keep microphone permission only if the existing UI already uses it
+
+Stage 13 — Error handling:
+The app should not crash if:
+- a model is missing
+- a model is not loaded yet
+- model input shape is unexpected
+- model output shape is unexpected
+- pose landmarks are empty
+- face landmarks are empty
+- body_language input cannot be prepared
+- body_language output labels are unknown
+
+Use safe fallbacks:
+- pose heuristic feedback
+- face heuristic feedback
+- debug unavailable state
+- no feedback if confidence is too low
+
+Stage 14 — Final response after implementation:
+After making changes, provide:
+1. Short summary of what changed
+2. Files modified
+3. How the live pipeline now works
+4. How body_language input is prepared
+5. Whether body_language labels are confirmed or provisional
+6. Any assumptions made
+7. Any unresolved issues
+8. Next recommended step
+
+Important:
+Start by inspecting the repository and explaining the current pipeline.
+Then implement the smallest safe refactor needed.
+Do not rewrite unrelated files.
+Do not install new libraries unless absolutely necessary.
+Do not add Firebase.
+Do not add native modules.
+Do not switch to MediaPipe Task API.
+Do not pretend uncertain labels are confirmed.
+Do not use body_language class index 0 as bad posture unless verified.
